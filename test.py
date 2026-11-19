@@ -1,64 +1,54 @@
-import sqlite3
-import pandas as pd
+"""
+Step 1: download the dataset, convert to Parquet, and PROFILE it before modelling.
+Run:  python src/01_load_and_profile.py
+Everything printed here should feed Chapter 3 (data description) and Chapter 4.
+"""
+import glob, os
+import duckdb
+from huggingface_hub import snapshot_download
 
-# Connect to database and check exact class distribution
-conn = sqlite3.connect("database/fraud_detection.db")
-df1 = pd.read_sql("SELECT is_fraud, COUNT(*) as count FROM transactions GROUP BY is_fraud", conn)
-df = pd.read_sql("SELECT * FROM transactions", conn)
-conn.close()
+REPO = "electricsheepafrica/Nigerian-Financial-Transactions-and-Fraud-Detection-Dataset"
+OUT = "data/transactions.parquet"
 
-print("Exact Fraud Distribution in Database:")
-print(df1)
+os.makedirs("data", exist_ok=True)
+if not os.path.exists(OUT):
+    local = snapshot_download(repo_id=REPO, repo_type="dataset")
+    files = glob.glob(f"{local}/**/*.csv", recursive=True) + glob.glob(f"{local}/**/*.parquet", recursive=True)
+    print("Found files:", files)
+    src = files[0]  # if there are several shards, change this to a glob pattern
+    reader = f"read_csv_auto('{src}')" if src.endswith(".csv") else f"read_parquet('{src}')"
+    duckdb.sql(f"COPY (SELECT * FROM {reader}) TO '{OUT}' (FORMAT PARQUET)")
 
+con = duckdb.connect()
+con.sql(f"CREATE VIEW t AS SELECT * FROM read_parquet('{OUT}')")
 
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import precision_recall_curve, classification_report
+print("\n--- Row count & class balance ---")
+print(con.sql("SELECT COUNT(*) AS n, SUM(is_fraud::INT) AS frauds, "
+              "ROUND(100.0*AVG(is_fraud::INT),3) AS fraud_pct FROM t").df())
 
+print("\n--- Fraud types ---")
+print(con.sql("SELECT fraud_type, COUNT(*) n FROM t GROUP BY 1 ORDER BY 2 DESC").df())
 
-df = df.sample(n=500000, random_state=42)
-target_column = 'is_fraud' 
-cols_to_drop = [target_column, 'fraud_type', 'transaction_id', 'timestamp', 'ip_address', 'device_hash']
-cols_to_drop = [col for col in cols_to_drop if col in df.columns]
+print("\n--- Date range ---")
+print(con.sql("SELECT MIN(timestamp) AS first, MAX(timestamp) AS last FROM t").df())
 
-X = df.drop(columns=cols_to_drop)
-y = df[target_column]
+print("\n--- Accounts & history depth (needed for SQL features) ---")
+print(con.sql("""
+  SELECT COUNT(DISTINCT sender_account) AS senders,
+         ROUND(AVG(c),1) AS avg_txns_per_sender, MEDIAN(c) AS median_txns
+  FROM (SELECT sender_account, COUNT(*) c FROM t GROUP BY 1)
+""").df())
 
-# 2. Encode categorical columns
-for col in X.select_dtypes(include=['object', 'category']).columns:
-    le = LabelEncoder()
-    X[col] = le.fit_transform(X[col].fillna("MISSING").astype(str))
-X = X.fillna(0)
+print("\n--- Missing values (top 15) ---")
+cols = [r[0] for r in con.sql("DESCRIBE t").fetchall()]
+nulls = " UNION ALL ".join(f"SELECT '{c}' AS col, SUM(({c} IS NULL)::INT) AS nulls FROM t" for c in cols)
+print(con.sql(f"SELECT * FROM ({nulls}) ORDER BY nulls DESC LIMIT 15").df())
 
-# 3. Split
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
+print("\n--- Sanity check: negative time_since_last_transaction? ---")
+print(con.sql("SELECT COUNT(*) AS negatives FROM t WHERE time_since_last_transaction < 0").df())
 
-# 4. Train Model
-print("Training model...")
-model = RandomForestClassifier(
-    random_state=42, 
-    n_jobs=-1, 
-    n_estimators=100,
-    max_depth=15,
-    class_weight='balanced'
-)
-model.fit(X_train, y_train)
-
-# 5. Find the Optimal Threshold automatically using F1-score
-y_probs = model.predict_proba(X_test)[:, 1]
-precisions, recalls, thresholds = precision_recall_curve(y_test, y_probs)
-
-# Avoid division by zero
-f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
-best_threshold_idx = np.argmax(f1_scores)
-best_threshold = thresholds[best_threshold_idx]
-
-print(f"\n✨ Optimal Threshold Found: {best_threshold:.4f}")
-
-# Evaluate with the scientifically optimal threshold
-y_optimal_pred = (y_probs >= best_threshold).astype(int)
-print(classification_report(y_test, y_optimal_pred))
+print("\n--- LEAKAGE CHECK: fraud rate by value of the pre-computed risk columns ---")
+for c in ["merchant_fraud_rate", "persona_fraud_risk", "location_fraud_risk", "channel_risk_score"]:
+    print(f"\n{c}")
+    print(con.sql(f"SELECT ROUND({c},2) AS v, COUNT(*) n, ROUND(100*AVG(is_fraud::INT),2) AS fraud_pct "
+                  f"FROM t GROUP BY 1 ORDER BY 1 LIMIT 12").df())
